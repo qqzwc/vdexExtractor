@@ -4,7 +4,7 @@ Command line tool to decompile and extract Android Dex bytecode from Vdex files 
 along with Oat files when optimizing bytecode from dex2oat ART runtime compiler. Vdex file format
 has been introduced in the Oreo (API-26) build. More information is available [here][vdex-cr]. It
 should be noted that Oat files are no longer storing the matching Dex files inside their `.rodata`
-section. Instead they're always paired with a matching Vdex file.
+section. Instead they're always paired with a matching Vdex container file.
 
 
 ## Compile
@@ -21,11 +21,23 @@ section. Instead they're always paired with a matching Vdex file.
 * For debug builds use `$ DEBUG=true ./make.sh`
 
 
+## Dependencies
+
+The following external libraries should be installed the in the host system:
+
+1. zlib
+    * macOS with homebrew: `brew install zlib-devel`
+    * macOS with macports: `port install zlib`
+    * Linux with apt: `apt install libz-dev`
+    * Other Linux/Unix systems: Check available package manager or compile from sources
+    * Windows with cygwin: Install `zlib-devel` from cygwin installer
+
+
 ## Usage
 
 ```
 $ bin/vdexExtractor -h
-              vdexExtractor ver. 0.4.1
+              vdexExtractor ver. 0.5.2
     Anestis Bechtsoudis <anestis@census-labs.com>
   Copyright 2017 - 2018 by CENSUS S.A. All Rights Reserved.
 
@@ -37,6 +49,7 @@ $ bin/vdexExtractor -h
  --dis                : enable bytecode disassembler
  --ignore-crc-error   : decompiled Dex CRC errors are ignored (see issue #3)
  --new-crc=<path>     : text file with extracted Apk or Dex file location checksum(s)
+ --get-api             : get Android API level based on Vdex version (expects single Vdex file)
  -v, --debug=LEVEL    : log level (0 - FATAL ... 4 - DEBUG), default: '3' (INFO)
  -l, --log-file=<path>: save disassembler and/or verified dependencies output to log file (default is STDOUT)
  -h, --help           : this help
@@ -53,7 +66,10 @@ AOSP.
 The Vdex fully unquicken functionality has been also implemented as part of the AOSP oatdump libart
 tool. The upstream contribution is available [here][aosp-master]. If you want to use oatdump with
 Oreo release you can use the corresponding patch [here][oatdump-oreo] or fork and build (inside and
-AOSP_SRC_ROOT workspace) the oreo-release branch of the [oatdump++][oatdump-plus] tool.
+AOSP_SRC_ROOT workspace) the oreo-release branch of the [oatdump++][oatdump-plus] tool. Google has
+released the contributed patches along with the Android Pie release of the ART runtime. However,
+the upstream oatdump is appending the entire de-duplicated shared data section at the end of each
+CompactDex file when exporting.
 
 
 ## Verified Dependencies Iterator
@@ -220,6 +236,54 @@ file #0: classDefsSize=8840
       1abbe2: e823 1000                              |001f: iput-object-quick v3, v2, [obj+0010]
 ```
 
+## Compact Dex Converter
+
+The Android 9 (Pie) release has introduced a new type of Dex file, the Compact Dex (Cdex). Cdex is
+an ART internal file format that is compacting various Dex data structs (e.g. method header) and
+deduplicates common data blobs (e.g. strings) in multi-dex files. The deduplicated data from the
+Dex files of an input application are stored in the shared section of the Vdex container.
+
+Now since the Vdex containers are storing Cdex files instead of standard Dex, the vdexExtractor
+backends (starting from version 019) have been updated to support them too. However, since the tool
+does not implement a Dex IR it is not possible to convert a Cdex file back to standard Dex without
+using an external tool. For this purpose the "compact_dex_converter" tool has been written, which
+uses the libdexlayout (Dex IR) from the AOSP art repo. The source code of the tool is available
+[here](https://gist.github.com/anestisb/30265097ad9a5ea2f0ddf7e36db3f07d). Compiling the tool
+requires forking the necessary AOSP repos and building as an AOSP module.
+
+For convenience vdexExtractor is implementing a helper tool (see "tools/deodex" in the following
+section) that downloads a set of precompiled binaries and wraps around the required automation. In
+addition the "compact_dex_converter" binaries can be downloaded from the following links:
+
+* Linux x86-64
+  * With shared libraries: https://1drv.ms/u/s!ArDC4mvMyPrRhEsiuPjOF_ssIfOe
+  * With shared libraries **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhE3Z2jdBXJIhazjc
+  * Statically compiled: https://1drv.ms/u/s!ArDC4mvMyPrRhEq96XX-LsCACF2s
+  * Statically compiled **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhEwmwM8--zdhoCB2
+* Linux x86-64 old CPUs (no SSE4.2 & no POPCNT [#29](https://github.com/anestisb/vdexExtractor/issues/29))
+  * With shared libraries: https://1drv.ms/u/s!ArDC4mvMyPrRhFP46IyBqOtihS9s
+  * With shared libraries **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhFXEGW9vrlMlTKDJ
+  * Statically compiled: https://1drv.ms/u/s!ArDC4mvMyPrRhFIFZCF9TtEHVooc
+  * Statically compiled **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhFSMELB_H3w5Cdfe
+* ARM64 (aarch64)
+  * With shared libraries: https://1drv.ms/u/s!ArDC4mvMyPrRhEindMOf3aWCbQRr
+  * With shared libraries **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhEnU9Ei_3MeQipGr
+  * Statically compiled: NOT SUPPORTED
+* macOS
+  * With shared libraries: https://1drv.ms/u/s!ArDC4mvMyPrRhE45gEUNolEiZ50u
+  * With shared libraries **debug**: https://1drv.ms/u/s!ArDC4mvMyPrRhFG5WH_zNz0jNarZ
+  * Statically compiled: NOT SUPPORTED
+
+The 's' suffix in binary names stands for "statically compiled" and the 'd' for "debug" build. They
+can be also combined (e.g. 'ds' - statically compiled debug build).
+
+### Update 14 Sept. 2018
+
+A functionally equivalent upstream
+[patch](https://android-review.googlesource.com/c/platform/art/+/751510) to art's oatdump utility
+has been contributed. AOSP master has merged, so hopefully it will ship with the next major OS
+update.
+
 
 ## Utility Scripts
 
@@ -260,12 +324,50 @@ file #0: classDefsSize=8840
         -h|--help         : This help message
   ```
 
+* **tools/deodex/run.sh**
+
+  Helper tool to decompile (deodex) Vdex resources back to standard Dex files in a bulk manner. The
+  tool is automatically handling the case of CompactDex files (as introduced in Android Pie) and
+  uses the compact_dex_converter tool (more info
+  [here](https://github.com/anestisb/vdexExtractor/issues/23)) to convert back to StandardDex. Since
+  the converter is compiled as part of the AOSP sources, a set of binaries for Linux & maacOS is
+  maintained from the developer for convenience.
+
+  ```text
+  $ tools/deodex/run.sh -h
+    Usage: run.sh [options]
+      options:
+        -i|--input <path> : Directory with Vdex files or single file
+        -o|--output <dir> : Directory to save deodex'ed resources (default is '.')
+        -k|--keep         : Keep intermediate files (default 'false')
+        -h|--help         : This help message
+
+  $ tools/deodex/run.sh -i /tmp/vdex_samples -o /tmp/deodexed_samples
+  [INFO]: Processing 140 input Vdex files
+  [INFO]: 140 binaries have been successfully deodexed
+  ```
 
 ## Changelog
 
-* __0.5.0__ - TBC
-  * Vdex 019 support for Android Pie (WIP)
-  * Improved input file sanity checks to avoid malformed Vdex crashing the tool
+* __0.5.3__ - TBC
+  * Fix an issue in the method iterator of the Vdex 006 & 010 backends
+* __0.5.2__ - 22 September 2018
+  * Fix an issue when decompiling framework bytecode the APIs of which have been hidden
+* __0.5.1__ - 3 September 2018
+  * Improve handling of deduplicated shared data section when exporting CompactDex files after
+    decompilation
+  * Fixes an OOB read issue in Vdex 010 decompiler
+  * Fix Dex output header formatting glitch due to different magic size of CompactDex & StandardDex
+  * Option (`--get-api`) to query Android API level of a Vdex file (mostly useful when scripting
+    around the tool)
+  * deodex helper tool and URLs for compact_dex_converter binaries for Linux & macOS
+* __0.5.0__ - 30 August 2018
+  * Vdex 019 support for Android Pie (verifier dependencies, decompiler & disassembler)
+  * Extended Dex file parsing library to support CompactDex files
+  * Extended disassembler engine to support CompactDex files as processed from the Android Pie
+    Vdex containers
+  * Improved input files sanity checks to avoid malformed Vdex crashing the tool
+  * Various bug fixes and disassembler output improvements
 * __0.4.1__ - 4 March 2018
   * Fix Vdex 006 NOP decompilation issue
   * Support multi-depth directory recursion for input path

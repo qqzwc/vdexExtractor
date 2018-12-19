@@ -25,12 +25,12 @@
 #include "log.h"
 #include "out_writer.h"
 #include "utils.h"
-#include "vdex.h"
 #include "vdex/vdex_006.h"
 #include "vdex/vdex_010.h"
 #include "vdex/vdex_019.h"
+#include "vdex_api.h"
 
-bool vdex_initEnv(const u1 *cursor, vdex_env_t *env) {
+bool vdexApi_initEnv(const u1 *cursor, vdex_api_env_t *env) {
   // Check if a supported Vdex version is found
   if (vdex_006_isValidVdex(cursor)) {
     LOGMSG(l_DEBUG, "Initializing environment for Vdex version '006'");
@@ -55,10 +55,10 @@ bool vdex_initEnv(const u1 *cursor, vdex_env_t *env) {
   return true;
 }
 
-bool vdex_updateChecksums(const char *inVdexFileName,
-                          int nCsums,
-                          u4 *checksums,
-                          const runArgs_t *pRunArgs) {
+bool vdexApi_updateChecksums(const char *inVdexFileName,
+                             int nCsums,
+                             u4 *checksums,
+                             const runArgs_t *pRunArgs) {
   bool ret = false;
   off_t fileSz = 0;
   int srcfd = -1;
@@ -99,6 +99,36 @@ bool vdex_updateChecksums(const char *inVdexFileName,
 
   if (!outWriter_VdexFile(pRunArgs, inVdexFileName, buf, fileSz)) {
     LOGMSG(l_ERROR, "Failed to write updated Vdex file");
+    goto fini;
+  }
+
+  ret = true;
+
+fini:
+  munmap(buf, fileSz);
+  close(srcfd);
+  return ret;
+}
+
+bool vdexApi_printApiLevel(const char *inVdexFileName) {
+  bool ret = false;
+  off_t fileSz = 0;
+  int srcfd = -1;
+  u1 *buf = NULL;
+
+  buf = utils_mapFileToRead(inVdexFileName, &fileSz, &srcfd);
+  if (buf == NULL) {
+    LOGMSG(l_ERROR, "'%s' open & map failed", inVdexFileName);
+    return ret;
+  }
+
+  if (vdex_006_isValidVdex(buf)) {
+    log_raw("API-26\n");
+  } else if (vdex_010_isValidVdex(buf)) {
+    log_raw("API-27\n");
+  } else if (vdex_019_isValidVdex(buf)) {
+    log_raw("API-28\n");
+  } else {
     goto fini;
   }
 

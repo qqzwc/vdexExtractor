@@ -41,12 +41,15 @@ ifneq (,$(findstring -m32,$(CFLAGS)))
 endif
 endif
 
+GIT_VERSION := $(shell git rev-parse --short HEAD | tr -d "\n")
+CFLAGS += -DVERSION=\"dev-$(GIT_VERSION)\"
+
 .PHONY: default all clean
 
 default: $(TARGET)
 all: default
 
-OBJECTS = $(patsubst %.c, %.o, $(wildcard *.c) $(wildcard */*.c))
+OBJECTS = $(patsubst %.c, %.o, $(sort $(wildcard *.c)) $(sort $(wildcard */*.c)))
 HEADERS = $(wildcard *.h)
 
 %.o: %.c $(HEADERS)

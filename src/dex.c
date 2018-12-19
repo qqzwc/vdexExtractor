@@ -23,26 +23,30 @@
 #include "dex.h"
 #include "utils.h"
 
-// CompactDex helper constants for CodeItem decoding
-static const size_t kRegistersSizeShift = 12;
-static const size_t kInsSizeShift = 8;
-static const size_t kOutsSizeShift = 4;
-static const size_t kTriesSizeSizeShift = 0;
-static const u2 kFlagPreHeaderRegisterSize = 0x1 << 0;
-static const u2 kFlagPreHeaderInsSize = 0x1 << 1;
-static const u2 kFlagPreHeaderOutsSize = 0x1 << 2;
-static const u2 kFlagPreHeaderTriesSize = 0x1 << 3;
-static const u2 kFlagPreHeaderInsnsSize = 0x1 << 4;
-static const size_t kInsnsSizeShift = 5;
-// static const size_t kBitsPerByte = 8;
-// static const size_t kInsnsSizeBits = sizeof(u2) * kBitsPerByte -  kInsnsSizeShift;
-static const u2 kFlagPreHeaderCombined = kFlagPreHeaderRegisterSize | kFlagPreHeaderInsSize |
-                                         kFlagPreHeaderOutsSize | kFlagPreHeaderTriesSize |
-                                         kFlagPreHeaderInsnsSize;
-
 static bool enableDisassembler = false;
 
 static inline u2 get2LE(unsigned char const *pSrc) { return pSrc[0] | (pSrc[1] << 8); }
+
+static inline bool IsLeb128Terminator(const u1 *ptr) { return *ptr <= 0x7f; }
+
+// Returns the number of bytes needed to encode the value in unsigned LEB128.
+static inline u4 ULeb128Size(u4 data) {
+  // bits_to_encode = (data != 0) ? 32 - CLZ(x) : 1  // 32 - CLZ(data | 1)
+  // bytes = ceil(bits_to_encode / 7.0);             // (6 + bits_to_encode) / 7
+  u4 x = 6 + 32 - __builtin_clz(data | 1U);
+
+  // Division by 7 is done by (x * 37) >> 8 where 37 = ceil(256 / 7).
+  // This works for 0 <= x < 256 / (7 * 37 - 256), i.e. 0 <= x <= 85.
+  return (x * 37) >> 8;
+}
+
+static inline bool IsPowerOfTwo(u4 x) { return (x & (x - 1)) == 0; }
+
+static inline bool IsFirstBitSet(u4 value) { return !IsPowerOfTwo(value & kAccVisibilityFlags); }
+
+static inline u4 GetSecondFlag(u4 value) {
+  return ((value & kAccNative) != 0) ? kAccDexHiddenBitNative : kAccDexHiddenBit;
+}
 
 // Helper for dex_dumpInstruction(), which builds the string representation
 // for the index in the given instruction.
@@ -614,68 +618,72 @@ void dex_dumpHeaderInfo(const u1 *cursor) {
   dexMagic magic = dex_getMagic(cursor);
   char *sigHex = utils_bin2hex(cursor + sizeof(dexMagic) + sizeof(u4), kSHA1Len);
 
-  log_dis("------ Dex Header Info ------\n");
-  log_dis("magic        : %.4s-%.4s\n", magic.dex, magic.ver);
-  log_dis("checksum     : %" PRIx32 " (%" PRIu32 ")\n", dex_getChecksum(cursor),
-          dex_getChecksum(cursor));
-  log_dis("signature    : %s\n", sigHex);
-  log_dis("fileSize     : %" PRIx32 " (%" PRIu32 ")\n", dex_getFileSize(cursor),
-          dex_getFileSize(cursor));
-  log_dis("headerSize   : %" PRIx32 " (%" PRIu32 ")\n", dex_getHeaderSize(cursor),
-          dex_getHeaderSize(cursor));
-  log_dis("endianTag    : %" PRIx32 " (%" PRIu32 ")\n", dex_getEndianTag(cursor),
-          dex_getEndianTag(cursor));
-  log_dis("linkSize     : %" PRIx32 " (%" PRIu32 ")\n", dex_getLinkSize(cursor),
-          dex_getLinkSize(cursor));
-  log_dis("linkOff      : %" PRIx32 " (%" PRIu32 ")\n", dex_getLinkOff(cursor),
-          dex_getLinkOff(cursor));
-  log_dis("mapOff       : %" PRIx32 " (%" PRIu32 ")\n", dex_getMapOff(cursor),
-          dex_getMapOff(cursor));
-  log_dis("stringIdsSize: %" PRIx32 " (%" PRIu32 ")\n", dex_getStringIdsSize(cursor),
-          dex_getStringIdsSize(cursor));
-  log_dis("stringIdsOff : %" PRIx32 " (%" PRIu32 ")\n", dex_getStringIdsOff(cursor),
-          dex_getStringIdsOff(cursor));
-  log_dis("typeIdsSize  : %" PRIx32 " (%" PRIu32 ")\n", dex_getTypeIdsSize(cursor),
-          dex_getTypeIdsSize(cursor));
-  log_dis("typeIdsOff   : %" PRIx32 " (%" PRIu32 ")\n", dex_getTypeIdsOff(cursor),
-          dex_getTypeIdsOff(cursor));
-  log_dis("protoIdsSize : %" PRIx32 " (%" PRIu32 ")\n", dex_getProtoIdsSize(cursor),
-          dex_getProtoIdsSize(cursor));
-  log_dis("protoIdsOff  : %" PRIx32 " (%" PRIu32 ")\n", dex_getProtoIdsOff(cursor),
-          dex_getProtoIdsOff(cursor));
-  log_dis("fieldIdsSize : %" PRIx32 " (%" PRIu32 ")\n", dex_getFieldIdsSize(cursor),
-          dex_getFieldIdsSize(cursor));
-  log_dis("fieldIdsOff  : %" PRIx32 " (%" PRIu32 ")\n", dex_getFieldIdsOff(cursor),
-          dex_getFieldIdsOff(cursor));
-  log_dis("methodIdsSize: %" PRIx32 " (%" PRIu32 ")\n", dex_getMethodIdsSize(cursor),
-          dex_getMethodIdsSize(cursor));
-  log_dis("methodIdsOff : %" PRIx32 " (%" PRIu32 ")\n", dex_getMethodIdsOff(cursor),
-          dex_getMethodIdsOff(cursor));
-  log_dis("classDefsSize: %" PRIx32 " (%" PRIu32 ")\n", dex_getClassDefsSize(cursor),
-          dex_getClassDefsSize(cursor));
-  log_dis("classDefsOff : %" PRIx32 " (%" PRIu32 ")\n", dex_getClassDefsOff(cursor),
-          dex_getClassDefsOff(cursor));
-  log_dis("dataSize     : %" PRIx32 " (%" PRIu32 ")\n", dex_getDataSize(cursor),
-          dex_getDataSize(cursor));
-  log_dis("dataOff      : %" PRIx32 " (%" PRIu32 ")\n", dex_getDataOff(cursor),
-          dex_getDataOff(cursor));
+  LOGMSG(l_DEBUG, "------ Dex Header Info ------");
+  if (dex_checkType(cursor) == kNormalDex) {
+    LOGMSG(l_DEBUG, "magic        : %.3s-%.3s", magic.dex, magic.ver);
+  } else {
+    LOGMSG(l_DEBUG, "magic        : %.4s-%.4s", magic.dex, magic.ver);
+  }
+  LOGMSG(l_DEBUG, "checksum     : %" PRIx32 " (%" PRIu32 ")", dex_getChecksum(cursor),
+         dex_getChecksum(cursor));
+  LOGMSG(l_DEBUG, "signature    : %s", sigHex);
+  LOGMSG(l_DEBUG, "fileSize     : %" PRIx32 " (%" PRIu32 ")", dex_getFileSize(cursor),
+         dex_getFileSize(cursor));
+  LOGMSG(l_DEBUG, "headerSize   : %" PRIx32 " (%" PRIu32 ")", dex_getHeaderSize(cursor),
+         dex_getHeaderSize(cursor));
+  LOGMSG(l_DEBUG, "endianTag    : %" PRIx32 " (%" PRIu32 ")", dex_getEndianTag(cursor),
+         dex_getEndianTag(cursor));
+  LOGMSG(l_DEBUG, "linkSize     : %" PRIx32 " (%" PRIu32 ")", dex_getLinkSize(cursor),
+         dex_getLinkSize(cursor));
+  LOGMSG(l_DEBUG, "linkOff      : %" PRIx32 " (%" PRIu32 ")", dex_getLinkOff(cursor),
+         dex_getLinkOff(cursor));
+  LOGMSG(l_DEBUG, "mapOff       : %" PRIx32 " (%" PRIu32 ")", dex_getMapOff(cursor),
+         dex_getMapOff(cursor));
+  LOGMSG(l_DEBUG, "stringIdsSize: %" PRIx32 " (%" PRIu32 ")", dex_getStringIdsSize(cursor),
+         dex_getStringIdsSize(cursor));
+  LOGMSG(l_DEBUG, "stringIdsOff : %" PRIx32 " (%" PRIu32 ")", dex_getStringIdsOff(cursor),
+         dex_getStringIdsOff(cursor));
+  LOGMSG(l_DEBUG, "typeIdsSize  : %" PRIx32 " (%" PRIu32 ")", dex_getTypeIdsSize(cursor),
+         dex_getTypeIdsSize(cursor));
+  LOGMSG(l_DEBUG, "typeIdsOff   : %" PRIx32 " (%" PRIu32 ")", dex_getTypeIdsOff(cursor),
+         dex_getTypeIdsOff(cursor));
+  LOGMSG(l_DEBUG, "protoIdsSize : %" PRIx32 " (%" PRIu32 ")", dex_getProtoIdsSize(cursor),
+         dex_getProtoIdsSize(cursor));
+  LOGMSG(l_DEBUG, "protoIdsOff  : %" PRIx32 " (%" PRIu32 ")", dex_getProtoIdsOff(cursor),
+         dex_getProtoIdsOff(cursor));
+  LOGMSG(l_DEBUG, "fieldIdsSize : %" PRIx32 " (%" PRIu32 ")", dex_getFieldIdsSize(cursor),
+         dex_getFieldIdsSize(cursor));
+  LOGMSG(l_DEBUG, "fieldIdsOff  : %" PRIx32 " (%" PRIu32 ")", dex_getFieldIdsOff(cursor),
+         dex_getFieldIdsOff(cursor));
+  LOGMSG(l_DEBUG, "methodIdsSize: %" PRIx32 " (%" PRIu32 ")", dex_getMethodIdsSize(cursor),
+         dex_getMethodIdsSize(cursor));
+  LOGMSG(l_DEBUG, "methodIdsOff : %" PRIx32 " (%" PRIu32 ")", dex_getMethodIdsOff(cursor),
+         dex_getMethodIdsOff(cursor));
+  LOGMSG(l_DEBUG, "classDefsSize: %" PRIx32 " (%" PRIu32 ")", dex_getClassDefsSize(cursor),
+         dex_getClassDefsSize(cursor));
+  LOGMSG(l_DEBUG, "classDefsOff : %" PRIx32 " (%" PRIu32 ")", dex_getClassDefsOff(cursor),
+         dex_getClassDefsOff(cursor));
+  LOGMSG(l_DEBUG, "dataSize     : %" PRIx32 " (%" PRIu32 ")", dex_getDataSize(cursor),
+         dex_getDataSize(cursor));
+  LOGMSG(l_DEBUG, "dataOff      : %" PRIx32 " (%" PRIu32 ")", dex_getDataOff(cursor),
+         dex_getDataOff(cursor));
 
   if (dex_checkType(cursor) == kCompactDex) {
-    log_dis("featureFlags                : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getFeatureFlags(cursor), dex_getFeatureFlags(cursor));
-    log_dis("debuginfoOffsetsPos         : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getDebugInfoOffsetsPos(cursor), dex_getDebugInfoOffsetsPos(cursor));
-    log_dis("debugInfoOffsetsTableOffset : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getDebugInfoOffsetsTableOffset(cursor), dex_getDebugInfoOffsetsTableOffset(cursor));
-    log_dis("debugInfoBase               : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getDebugInfoBase(cursor), dex_getDebugInfoBase(cursor));
-    log_dis("ownedDataBegin              : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getOwnedDataBegin(cursor), dex_getOwnedDataBegin(cursor));
-    log_dis("ownedDataEnd                : %" PRIx32 " (%" PRIu32 ")\n",
-            dex_getOwnedDataEnd(cursor), dex_getOwnedDataEnd(cursor));
+    LOGMSG(l_DEBUG, "featureFlags                : %" PRIx32 " (%" PRIu32 ")",
+           dex_getFeatureFlags(cursor), dex_getFeatureFlags(cursor));
+    LOGMSG(l_DEBUG, "debuginfoOffsetsPos         : %" PRIx32 " (%" PRIu32 ")",
+           dex_getDebugInfoOffsetsPos(cursor), dex_getDebugInfoOffsetsPos(cursor));
+    LOGMSG(l_DEBUG, "debugInfoOffsetsTableOffset : %" PRIx32 " (%" PRIu32 ")",
+           dex_getDebugInfoOffsetsTableOffset(cursor), dex_getDebugInfoOffsetsTableOffset(cursor));
+    LOGMSG(l_DEBUG, "debugInfoBase               : %" PRIx32 " (%" PRIu32 ")",
+           dex_getDebugInfoBase(cursor), dex_getDebugInfoBase(cursor));
+    LOGMSG(l_DEBUG, "ownedDataBegin              : %" PRIx32 " (%" PRIu32 ")",
+           dex_getOwnedDataBegin(cursor), dex_getOwnedDataBegin(cursor));
+    LOGMSG(l_DEBUG, "ownedDataEnd                : %" PRIx32 " (%" PRIu32 ")",
+           dex_getOwnedDataEnd(cursor), dex_getOwnedDataEnd(cursor));
   }
 
-  log_dis("-----------------------------\n");
+  LOGMSG(l_DEBUG, "-----------------------------");
 
   free((void *)sigHex);
 }
@@ -728,6 +736,47 @@ u4 dex_readULeb128(const u1 **pStream) {
 
   *pStream = ptr;
   return (u4)result;
+}
+
+u1 *dex_writeULeb128(u1 *dest, u4 value) {
+  u1 out = value & 0x7f;
+  value >>= 7;
+  while (value != 0) {
+    *dest++ = out | 0x80;
+    out = value & 0x7f;
+    value >>= 7;
+  }
+  *dest++ = out;
+  return dest;
+}
+
+u1 *dex_reverseSearchULeb128(u1 *end_ptr) {
+  u1 *ptr = end_ptr;
+
+  // Move one byte back, check that this is the terminating byte.
+  ptr--;
+  CHECK(IsLeb128Terminator(ptr));
+
+  // Keep moving back while the previous byte is not a terminating byte.
+  // Fail after reading five bytes in case there isn't another Leb128 value
+  // before this one.
+  while (!IsLeb128Terminator(ptr - 1)) {
+    ptr--;
+    CHECK_LE(end_ptr - ptr, 5);
+  }
+
+  return ptr;
+}
+
+void dex_updateULeb128(u1 *dest, u4 value) {
+  const u1 *old_end = dest;
+  u4 old_value = dex_readULeb128(&old_end);
+  CHECK_LE(ULeb128Size(value), ULeb128Size(old_value));
+  for (u1 *end = dex_writeULeb128(dest, value); end < old_end; end++) {
+    // Use longer encoding than necessary to fill the allocated space.
+    end[-1] |= 0x80;
+    end[0] = 0;
+  }
 }
 
 s4 dex_readSLeb128(const u1 **data) {
@@ -1296,6 +1345,38 @@ void dex_DecodeCDexFields(cdexCode *pCdexCode,
   if (!decodeOnlyInsrCnt) {
     *registersSize += *insSize;
   }
+}
+
+void dex_getCodeItemInfo(const u1 *dexFileBuf, dexMethod *pDexMethod, u2 **pCode, u4 *codeSize) {
+  // We have different code items in StandardDex and CompactDex
+  if (dex_checkType(dexFileBuf) == kNormalDex) {
+    dexCode *pDexCode = (dexCode *)(dex_getDataAddr(dexFileBuf) + pDexMethod->codeOff);
+    *pCode = pDexCode->insns;
+    *codeSize = pDexCode->insnsSize;
+  } else {
+    cdexCode *pCdexCode = (cdexCode *)(dex_getDataAddr(dexFileBuf) + pDexMethod->codeOff);
+    *pCode = pCdexCode->insns;
+    dex_DecodeCDexFields(pCdexCode, codeSize, NULL, NULL, NULL, NULL, true);
+  }
+}
+
+u4 dex_decodeAccessFlagsFromDex(u4 dex_access_flags) {
+  u4 new_access_flags = dex_access_flags;
+  if (IsFirstBitSet(new_access_flags) != false) {
+    new_access_flags ^= kAccVisibilityFlags;
+  }
+  new_access_flags &= ~GetSecondFlag(new_access_flags);
+  return new_access_flags;
+}
+
+void dex_unhideAccessFlags(u1 *data_ptr, u4 new_access_flags, bool is_method) {
+  // Go back 1 uleb to start.
+  data_ptr = dex_reverseSearchULeb128(data_ptr);
+  if (is_method) {
+    // Methods have another uleb field before the access flags
+    data_ptr = dex_reverseSearchULeb128(data_ptr);
+  }
+  dex_updateULeb128(data_ptr, new_access_flags);
 }
 
 void dex_setDisassemblerStatus(bool status) { enableDisassembler = status; }

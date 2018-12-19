@@ -20,11 +20,9 @@
 
 */
 
-#include <sys/mman.h>
-
+#include "vdex_backend_006.h"
 #include "../out_writer.h"
 #include "../utils.h"
-#include "vdex_backend_006.h"
 #include "vdex_decompiler_006.h"
 
 static inline u4 decodeUint32WithOverflowCheck(const u1 **in, const u1 *end) {
@@ -149,8 +147,10 @@ static void dumpDepsMethodInfo(const u1 *dexFileBuf,
 }
 
 static vdexDeps_006 *initDepsInfo(const u1 *vdexFileBuf) {
-  if (vdex_006_GetVerifierDepsDataSize(vdexFileBuf) == 0) {
-    // Return eagerly, as the first thing we expect from VerifierDeps data is
+  vdex_data_array_t vDeps;
+  vdex_006_GetVerifierDeps(vdexFileBuf, &vDeps);
+  if (vDeps.size == 0) {
+    // Return early, as the first thing we expect from VerifierDeps data is
     // the number of created strings, even if there is no dependency.
     return NULL;
   }
@@ -164,8 +164,8 @@ static vdexDeps_006 *initDepsInfo(const u1 *vdexFileBuf) {
   const u1 *dexFileBuf = NULL;
   u4 offset = 0;
 
-  const u1 *depsDataStart = vdex_006_GetVerifierDepsData(vdexFileBuf);
-  const u1 *depsDataEnd = depsDataStart + vdex_006_GetVerifierDepsDataSize(vdexFileBuf);
+  const u1 *depsDataStart = vDeps.data;
+  const u1 *depsDataEnd = depsDataStart + vDeps.size;
 
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     dexFileBuf = vdex_006_GetNextDexFileData(vdexFileBuf, &offset);
@@ -204,6 +204,24 @@ static vdexDeps_006 *initDepsInfo(const u1 *vdexFileBuf) {
   return pVdexDeps;
 }
 
+static bool hasDepsData(vdexDeps_006 *pVdexDeps) {
+  for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
+    const vdexDepData_006 *pVdexDepData = &pVdexDeps->pVdexDepData[i];
+    if (pVdexDepData->extraStrings.numberOfStrings > 0 ||
+        pVdexDepData->assignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->unassignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->classes.numberOfEntries > 0 || pVdexDepData->fields.numberOfEntries > 0 ||
+        pVdexDepData->directMethods.numberOfEntries > 0 ||
+        pVdexDepData->virtualMethods.numberOfEntries > 0 ||
+        pVdexDepData->interfaceMethods.numberOfEntries > 0 ||
+        pVdexDepData->unvfyClasses.numberOfEntries > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void destroyDepsInfo(const vdexDeps_006 *pVdexDeps) {
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     free((void *)pVdexDeps->pVdexDepData[i].extraStrings.strings);
@@ -224,8 +242,13 @@ void vdex_backend_006_dumpDepsInfo(const u1 *vdexFileBuf) {
   // Initialize depsInfo structs
   vdexDeps_006 *pVdexDeps = initDepsInfo(vdexFileBuf);
   if (pVdexDeps == NULL) {
-    LOGMSG(l_WARN, "Empty verified dependency data");
+    LOGMSG(l_WARN, "Malformed verified dependencies data");
     return;
+  }
+
+  if (!hasDepsData(pVdexDeps)) {
+    LOGMSG(l_DEBUG, "Empty verified dependencies data");
+    goto cleanup;
   }
 
   log_dis("------- Vdex Deps Info -------\n");
@@ -303,7 +326,8 @@ void vdex_backend_006_dumpDepsInfo(const u1 *vdexFileBuf) {
   }
   log_dis("----- EOF Vdex Deps Info -----\n");
 
-  // Cleanup
+// Cleanup
+cleanup:
   destroyDepsInfo(pVdexDeps);
 }
 
@@ -317,11 +341,12 @@ int vdex_backend_006_process(const char *VdexFileName,
     return -1;
   }
 
-  const vdexHeader_006 *pVdexHeader = (const vdexHeader_006 *)cursor;
-  const u1 *quickening_info_ptr = vdex_006_GetQuickeningInfo(cursor);
-  const u1 *const quickening_info_end =
-      vdex_006_GetQuickeningInfo(cursor) + vdex_006_GetQuickeningInfoSize(cursor);
+  vdex_data_array_t quickInfo;
+  vdex_006_GetQuickeningInfo(cursor, &quickInfo);
+  const u1 *quickening_info_ptr = quickInfo.data;
+  const u1 *const quickening_info_end = quickInfo.data + quickInfo.size;
 
+  const vdexHeader_006 *pVdexHeader = (const vdexHeader_006 *)cursor;
   const u1 *dexFileBuf = NULL;
   u4 offset = 0;
 
@@ -344,6 +369,7 @@ int vdex_backend_006_process(const char *VdexFileName,
     log_dis("file #%zu: classDefsSize=%" PRIu32 "\n", dex_file_idx,
             dex_getClassDefsSize(dexFileBuf));
     for (u4 i = 0; i < dex_getClassDefsSize(dexFileBuf); ++i) {
+      u4 lastIdx = 0;
       const dexClassDef *pDexClassDef = dex_getClassDef(dexFileBuf, i);
       dex_dumpClassInfo(dexFileBuf, i);
 
@@ -374,18 +400,20 @@ int vdex_backend_006_process(const char *VdexFileName,
       }
 
       // For each direct method
+      lastIdx = 0;  // transition to next array, reset last index
       for (u4 j = 0; j < pDexClassDataHeader.directMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "direct");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "direct");
+        lastIdx += curDexMethod.methodIdx;
 
         // Skip empty methods
         if (curDexMethod.codeOff == 0) {
           continue;
         }
 
-        if (pRunArgs->unquicken && vdex_006_GetQuickeningInfoSize(cursor) != 0) {
+        if (pRunArgs->unquicken && quickInfo.size != 0) {
           // For quickening info blob the first 4bytes are the inner blobs size
           u4 quickening_size = *(u4 *)quickening_info_ptr;
           quickening_info_ptr += sizeof(u4);
@@ -401,18 +429,20 @@ int vdex_backend_006_process(const char *VdexFileName,
       }
 
       // For each virtual method
+      lastIdx = 0;  // transition to next array, reset last index
       for (u4 j = 0; j < pDexClassDataHeader.virtualMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "virtual");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "virtual");
+        lastIdx += curDexMethod.methodIdx;
 
         // Skip native or abstract methods
         if (curDexMethod.codeOff == 0) {
           continue;
         }
 
-        if (pRunArgs->unquicken && vdex_006_GetQuickeningInfoSize(cursor) != 0) {
+        if (pRunArgs->unquicken && quickInfo.size != 0) {
           // For quickening info blob the first 4bytes are the inner blobs size
           u4 quickening_size = *(u4 *)quickening_info_ptr;
           quickening_info_ptr += sizeof(u4);

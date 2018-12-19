@@ -23,7 +23,6 @@
 #ifndef _VDEX_019_H_
 #define _VDEX_019_H_
 
-#include <zlib.h>
 #include "../common.h"
 #include "../dex.h"
 #include "vdex_common.h"
@@ -144,12 +143,15 @@ u4 vdex_019_DexEndOffset(const u1 *);
 const u1 *vdex_019_GetNextDexFileData(const u1 *, u4 *);
 u4 vdex_019_GetLocationChecksum(const u1 *, u4);
 void vdex_019_SetLocationChecksum(const u1 *, u4, u4);
-const u1 *vdex_019_GetVerifierDepsData(const u1 *);
-u4 vdex_019_GetVerifierDepsDataOffset(const u1 *);
-u4 vdex_019_GetVerifierDepsDataSize(const u1 *);
-const u1 *vdex_019_GetQuickeningInfo(const u1 *);
-u4 vdex_019_GetQuickeningInfoSize(const u1 *);
-u4 vdex_019_GetQuickeningInfoOffset(const u1 *);
+void vdex_019_GetVerifierDeps(const u1 *, vdex_data_array_t *);
+void vdex_019_GetQuickeningInfo(const u1 *, vdex_data_array_t *);
+
+u4 vdex_019_GetDexSectionHeaderOffset(const u1 *);
+const DexSectHeader *vdex_019_GetDexSectionHeader(const u1 *);
+
+// Vdex 019 introduces an intermediate set of tables that contain the QuickeningInfo offsets for
+// each Dex file in the container
+void vdex_019_GetQuickenInfoOffsetTable(const u1 *, const vdex_data_array_t *, vdex_data_array_t *);
 
 void vdex_019_dumpHeaderInfo(const u1 *);
 void vdex_019_dumpDepsInfo(const u1 *);

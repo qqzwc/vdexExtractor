@@ -20,21 +20,20 @@
 
 */
 
-#include <sys/mman.h>
-
+#include "vdex_backend_010.h"
 #include "../out_writer.h"
 #include "../utils.h"
-#include "vdex_backend_010.h"
+#include "vdex_common.h"
 #include "vdex_decompiler_010.h"
 
 static const u1 *quickening_info_ptr;
 static const unaligned_u4 *current_code_item_ptr;
 static const unaligned_u4 *current_code_item_end;
 
-static void QuickeningInfoItInit(u4 dex_file_idx,
-                                 u4 numberOfDexFiles,
-                                 const u1 *quicken_ptr,
-                                 u4 quicken_size) {
+static void QuickeningInfoIt_Init(u4 dex_file_idx,
+                                  u4 numberOfDexFiles,
+                                  const u1 *quicken_ptr,
+                                  u4 quicken_size) {
   quickening_info_ptr = quicken_ptr;
   const unaligned_u4 *dex_file_indices =
       (unaligned_u4 *)(quicken_ptr + quicken_size - numberOfDexFiles * sizeof(u4));
@@ -44,18 +43,16 @@ static void QuickeningInfoItInit(u4 dex_file_idx,
   current_code_item_ptr = (unaligned_u4 *)(quicken_ptr + dex_file_indices[dex_file_idx]);
 }
 
-static bool QuickeningInfoItDone() { return current_code_item_ptr == current_code_item_end; }
+static bool QuickeningInfoIt_Done() { return current_code_item_ptr == current_code_item_end; }
 
-static void QuickeningInfoItAdvance() { current_code_item_ptr += 2; }
+static void QuickeningInfoIt_Advance() { current_code_item_ptr += 2; }
 
-static u4 QuickeningInfoItGetCurrentCodeItemOffset() { return current_code_item_ptr[0]; }
+static u4 QuickeningInfoIt_GetCurrentCodeItemOffset() { return current_code_item_ptr[0]; }
 
-static const u1 *QuickeningInfoItGetCurrentPtr() {
-  return quickening_info_ptr + current_code_item_ptr[1] + sizeof(u4);
-}
-
-static u4 QuickeningInfoItGetCurrentSize() {
-  return *(unaligned_u4 *)(quickening_info_ptr + current_code_item_ptr[1]);
+static void GetCurrentQuickeningInfo(vdex_data_array_t *quickInfo) {
+  // Add sizeof(uint32_t) to remove the length from the data pointer.
+  quickInfo->data = quickening_info_ptr + current_code_item_ptr[1] + sizeof(u4);
+  quickInfo->size = *(unaligned_u4 *)(quickening_info_ptr + current_code_item_ptr[1]);
 }
 
 static inline u4 decodeUint32WithOverflowCheck(const u1 **in, const u1 *end) {
@@ -154,8 +151,10 @@ static const char *getStringFromId(const vdexDepData_010 *pVdexDepData,
 }
 
 static vdexDeps_010 *initDepsInfo(const u1 *vdexFileBuf) {
-  if (vdex_010_GetVerifierDepsDataSize(vdexFileBuf) == 0) {
-    // Return eagerly, as the first thing we expect from VerifierDeps data is
+  vdex_data_array_t vDeps;
+  vdex_010_GetVerifierDeps(vdexFileBuf, &vDeps);
+  if (vDeps.size == 0) {
+    // Return early, as the first thing we expect from VerifierDeps data is
     // the number of created strings, even if there is no dependency.
     return NULL;
   }
@@ -169,8 +168,8 @@ static vdexDeps_010 *initDepsInfo(const u1 *vdexFileBuf) {
   const u1 *dexFileBuf = NULL;
   u4 offset = 0;
 
-  const u1 *depsDataStart = vdex_010_GetVerifierDepsData(vdexFileBuf);
-  const u1 *depsDataEnd = depsDataStart + vdex_010_GetVerifierDepsDataSize(vdexFileBuf);
+  const u1 *depsDataStart = vDeps.data;
+  const u1 *depsDataEnd = depsDataStart + vDeps.size;
 
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     dexFileBuf = vdex_010_GetNextDexFileData(vdexFileBuf, &offset);
@@ -203,6 +202,22 @@ static vdexDeps_010 *initDepsInfo(const u1 *vdexFileBuf) {
   return pVdexDeps;
 }
 
+static bool hasDepsData(vdexDeps_010 *pVdexDeps) {
+  for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
+    const vdexDepData_010 *pVdexDepData = &pVdexDeps->pVdexDepData[i];
+    if (pVdexDepData->extraStrings.numberOfStrings > 0 ||
+        pVdexDepData->assignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->unassignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->classes.numberOfEntries > 0 || pVdexDepData->fields.numberOfEntries > 0 ||
+        pVdexDepData->methods.numberOfEntries > 0 ||
+        pVdexDepData->unvfyClasses.numberOfEntries > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void destroyDepsInfo(const vdexDeps_010 *pVdexDeps) {
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     free((void *)pVdexDeps->pVdexDepData[i].extraStrings.strings);
@@ -221,8 +236,13 @@ void vdex_backend_010_dumpDepsInfo(const u1 *vdexFileBuf) {
   // Initialize depsInfo structs
   vdexDeps_010 *pVdexDeps = initDepsInfo(vdexFileBuf);
   if (pVdexDeps == NULL) {
-    LOGMSG(l_WARN, "Empty verified dependency data");
+    LOGMSG(l_WARN, "Malformed verified dependencies data");
     return;
+  }
+
+  if (!hasDepsData(pVdexDeps)) {
+    LOGMSG(l_DEBUG, "Empty verified dependencies data");
+    goto cleanup;
   }
 
   log_dis("------- Vdex Deps Info -------\n");
@@ -318,7 +338,8 @@ void vdex_backend_010_dumpDepsInfo(const u1 *vdexFileBuf) {
   }
   log_dis("----- EOF Vdex Deps Info -----\n");
 
-  // Cleanup
+// Cleanup
+cleanup:
   destroyDepsInfo(pVdexDeps);
 }
 
@@ -338,9 +359,10 @@ int vdex_backend_010_process(const char *VdexFileName,
 
   // For each Dex file
   for (size_t dex_file_idx = 0; dex_file_idx < pVdexHeader->numberOfDexFiles; ++dex_file_idx) {
-    QuickeningInfoItInit(dex_file_idx, pVdexHeader->numberOfDexFiles,
-                         vdex_010_GetQuickeningInfo(cursor),
-                         vdex_010_GetQuickeningInfoSize(cursor));
+    vdex_data_array_t quickInfo;
+    vdex_010_GetQuickeningInfo(cursor, &quickInfo);
+    QuickeningInfoIt_Init(dex_file_idx, pVdexHeader->numberOfDexFiles, quickInfo.data,
+                          quickInfo.size);
 
     dexFileBuf = vdex_010_GetNextDexFileData(cursor, &offset);
     if (dexFileBuf == NULL) {
@@ -359,6 +381,7 @@ int vdex_backend_010_process(const char *VdexFileName,
     log_dis("file #%zu: classDefsSize=%" PRIu32 "\n", dex_file_idx,
             dex_getClassDefsSize(dexFileBuf));
     for (u4 i = 0; i < dex_getClassDefsSize(dexFileBuf); ++i) {
+      u4 lastIdx = 0;
       const dexClassDef *pDexClassDef = dex_getClassDef(dexFileBuf, i);
       dex_dumpClassInfo(dexFileBuf, i);
 
@@ -389,11 +412,13 @@ int vdex_backend_010_process(const char *VdexFileName,
       }
 
       // For each direct method
+      lastIdx = 0;  // transition to next array, reset last index
       for (u4 j = 0; j < pDexClassDataHeader.directMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "direct");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "direct");
+        lastIdx += curDexMethod.methodIdx;
 
         // Skip empty methods
         if (curDexMethod.codeOff == 0) {
@@ -401,17 +426,15 @@ int vdex_backend_010_process(const char *VdexFileName,
         }
 
         if (pRunArgs->unquicken) {
-          const u1 *quickening_ptr = QuickeningInfoItGetCurrentPtr();
-          u4 quickening_size = QuickeningInfoItGetCurrentSize();
-          if (!QuickeningInfoItDone() &&
-              curDexMethod.codeOff == QuickeningInfoItGetCurrentCodeItemOffset()) {
-            QuickeningInfoItAdvance();
-          } else {
-            quickening_ptr = NULL;
-            quickening_size = 0;
+          vdex_data_array_t curQuickInfo;
+          curQuickInfo.data = NULL;
+          curQuickInfo.size = 0;
+          if (!QuickeningInfoIt_Done() &&
+              curDexMethod.codeOff == QuickeningInfoIt_GetCurrentCodeItemOffset()) {
+            GetCurrentQuickeningInfo(&curQuickInfo);
+            QuickeningInfoIt_Advance();
           }
-          if (!vdex_decompiler_010_decompile(dexFileBuf, &curDexMethod, quickening_ptr,
-                                             quickening_size, true)) {
+          if (!vdex_decompiler_010_decompile(dexFileBuf, &curDexMethod, &curQuickInfo, true)) {
             LOGMSG(l_ERROR, "Failed to decompile Dex file");
             return -1;
           }
@@ -421,11 +444,13 @@ int vdex_backend_010_process(const char *VdexFileName,
       }
 
       // For each virtual method
+      lastIdx = 0;  // transition to next array, reset last index
       for (u4 j = 0; j < pDexClassDataHeader.virtualMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "virtual");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "virtual");
+        lastIdx += curDexMethod.methodIdx;
 
         // Skip native or abstract methods
         if (curDexMethod.codeOff == 0) {
@@ -433,17 +458,15 @@ int vdex_backend_010_process(const char *VdexFileName,
         }
 
         if (pRunArgs->unquicken) {
-          const u1 *quickening_ptr = QuickeningInfoItGetCurrentPtr();
-          u4 quickening_size = QuickeningInfoItGetCurrentSize();
-          if (!QuickeningInfoItDone() &&
-              curDexMethod.codeOff == QuickeningInfoItGetCurrentCodeItemOffset()) {
-            QuickeningInfoItAdvance();
-          } else {
-            quickening_ptr = NULL;
-            quickening_size = 0;
+          vdex_data_array_t curQuickInfo;
+          curQuickInfo.data = NULL;
+          curQuickInfo.size = 0;
+          if (!QuickeningInfoIt_Done() &&
+              curDexMethod.codeOff == QuickeningInfoIt_GetCurrentCodeItemOffset()) {
+            GetCurrentQuickeningInfo(&curQuickInfo);
+            QuickeningInfoIt_Advance();
           }
-          if (!vdex_decompiler_010_decompile(dexFileBuf, &curDexMethod, quickening_ptr,
-                                             quickening_size, true)) {
+          if (!vdex_decompiler_010_decompile(dexFileBuf, &curDexMethod, &curQuickInfo, true)) {
             LOGMSG(l_ERROR, "Failed to decompile Dex file");
             return -1;
           }
@@ -455,7 +478,7 @@ int vdex_backend_010_process(const char *VdexFileName,
 
     if (pRunArgs->unquicken) {
       // All QuickeningInfo data should have been consumed
-      if (!QuickeningInfoItDone()) {
+      if (!QuickeningInfoIt_Done()) {
         LOGMSG(l_ERROR, "Failed to use all quickening info");
         return -1;
       }

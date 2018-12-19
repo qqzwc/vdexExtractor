@@ -20,42 +20,77 @@
 
 */
 
-#include <sys/mman.h>
-
+#include "vdex_backend_019.h"
+#include "../hashset/hashset.h"
 #include "../out_writer.h"
 #include "../utils.h"
-#include "vdex_backend_019.h"
 #include "vdex_decompiler_019.h"
 
-static const u1 *quickening_info_ptr;
-static const unaligned_u4 *current_code_item_ptr;
-static const unaligned_u4 *current_code_item_end;
+const u4 *pCompactOffsetTable;
+u4 compactOffsetMinOffset;
+const u1 *pCompactOffsetDataBegin;
 
-static void QuickeningInfoItInit(u4 dex_file_idx,
-                                 u4 numberOfDexFiles,
-                                 const u1 *quicken_ptr,
-                                 u4 quicken_size) {
-  quickening_info_ptr = quicken_ptr;
-  const unaligned_u4 *dex_file_indices =
-      (unaligned_u4 *)(quicken_ptr + quicken_size - numberOfDexFiles * sizeof(u4));
-  current_code_item_end = (dex_file_idx == numberOfDexFiles - 1)
-                              ? dex_file_indices
-                              : (unaligned_u4 *)(quicken_ptr + dex_file_indices[dex_file_idx + 1]);
-  current_code_item_ptr = (unaligned_u4 *)(quicken_ptr + dex_file_indices[dex_file_idx]);
+static inline int POPCOUNT(uintptr_t x) {
+  return (sizeof(uintptr_t) == sizeof(u4)) ? __builtin_popcount(x) : __builtin_popcountll(x);
 }
 
-static bool QuickeningInfoItDone() { return current_code_item_ptr == current_code_item_end; }
-
-static void QuickeningInfoItAdvance() { current_code_item_ptr += 2; }
-
-static u4 QuickeningInfoItGetCurrentCodeItemOffset() { return current_code_item_ptr[0]; }
-
-static const u1 *QuickeningInfoItGetCurrentPtr() {
-  return quickening_info_ptr + current_code_item_ptr[1] + sizeof(u4);
+static void initCompactOffset(const u1 *cursor) {
+  pCompactOffsetDataBegin = cursor + (2 * sizeof(u4));
+  compactOffsetMinOffset = ((u4 *)cursor)[0];  // First 4 bytes are are the minimum offset
+  u4 tableOffset = ((u4 *)cursor)[1];          // Next 4 bytes are the table offset
+  pCompactOffsetTable = (u4 *)(pCompactOffsetDataBegin + tableOffset);
 }
 
-static u4 QuickeningInfoItGetCurrentSize() {
-  return *(unaligned_u4 *)(quickening_info_ptr + current_code_item_ptr[1]);
+// This value is coupled with the leb chunk bitmask. That logic must also be adjusted when the
+// integer is modified.
+static const size_t kElementsPerIndex = 16;
+
+// Leb block format:
+// [uint16_t] 16 bit mask for what indexes actually have a non zero offset for the chunk.
+// [lebs] Up to 16 lebs encoded using leb128, one leb bit. The leb specifies how the offset
+// changes compared to the previous index.
+static u4 getOffset(u4 index) {
+  const u4 offset = pCompactOffsetTable[index / kElementsPerIndex];
+  const size_t bit_index = index % kElementsPerIndex;
+
+  const u1 *block = pCompactOffsetDataBegin + offset;
+  u2 bit_mask = *block;
+  ++block;
+  bit_mask = (bit_mask << kBitsPerByte) | *block;
+  ++block;
+  if ((bit_mask & (1 << bit_index)) == 0) {
+    // Bit is not set means the offset is 0.
+    return 0u;
+  }
+  // Trim off the bits above the index we want and count how many bits are set. This is how many
+  // lebs we need to decode.
+  size_t count = POPCOUNT((uintptr_t)(bit_mask) << (kBitsPerIntPtrT - 1 - bit_index));
+  CHECK_GT(count, 0u);
+  u4 current_offset = compactOffsetMinOffset;
+  do {
+    current_offset += dex_readULeb128(&block);
+    --count;
+  } while (count > 0);
+  return current_offset;
+}
+
+static size_t quickenInfoTableSizeInBytes(const u1 *data, u4 dataSize) {
+  const u1 *tableData = data;
+  u4 elementsNum = dataSize != 0 ? dex_readULeb128(&tableData) : 0u;
+  return tableData + elementsNum * 2 - data;
+}
+
+static void getQuickeningInfoAt(const vdex_data_array_t *pQuickInfo,
+                                u4 offset,
+                                vdex_data_array_t *pSubQuickInfo) {
+  // Subtract offset of one since 0 represents unused and cannot be in the table.
+  CHECK_LE(offset, pQuickInfo->size);
+  const u1 *remaining = pQuickInfo->data + (offset - 1);
+  const u4 remainingSize = pQuickInfo->size - (offset - 1);
+
+  pSubQuickInfo->data = remaining;
+  pSubQuickInfo->size = quickenInfoTableSizeInBytes(remaining, remainingSize);
+  pSubQuickInfo->offset = pQuickInfo->offset + (remaining - pQuickInfo->data);
 }
 
 static inline u4 decodeUint32WithOverflowCheck(const u1 **in, const u1 *end) {
@@ -154,8 +189,11 @@ static const char *getStringFromId(const vdexDepData_019 *pVdexDepData,
 }
 
 static vdexDeps_019 *initDepsInfo(const u1 *vdexFileBuf) {
-  if (vdex_019_GetVerifierDepsDataSize(vdexFileBuf) == 0) {
-    // Return eagerly, as the first thing we expect from VerifierDeps data is
+  vdex_data_array_t vDeps;
+  vdex_019_GetVerifierDeps(vdexFileBuf, &vDeps);
+
+  if (vDeps.size == 0) {
+    // Return early, as the first thing we expect from VerifierDeps data is
     // the number of created strings, even if there is no dependency.
     return NULL;
   }
@@ -169,8 +207,8 @@ static vdexDeps_019 *initDepsInfo(const u1 *vdexFileBuf) {
   const u1 *dexFileBuf = NULL;
   u4 offset = 0;
 
-  const u1 *depsDataStart = vdex_019_GetVerifierDepsData(vdexFileBuf);
-  const u1 *depsDataEnd = depsDataStart + vdex_019_GetVerifierDepsDataSize(vdexFileBuf);
+  const u1 *depsDataStart = vDeps.data;
+  const u1 *depsDataEnd = depsDataStart + vDeps.size;
 
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     dexFileBuf = vdex_019_GetNextDexFileData(vdexFileBuf, &offset);
@@ -203,6 +241,22 @@ static vdexDeps_019 *initDepsInfo(const u1 *vdexFileBuf) {
   return pVdexDeps;
 }
 
+static bool hasDepsData(vdexDeps_019 *pVdexDeps) {
+  for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
+    const vdexDepData_019 *pVdexDepData = &pVdexDeps->pVdexDepData[i];
+    if (pVdexDepData->extraStrings.numberOfStrings > 0 ||
+        pVdexDepData->assignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->unassignTypeSets.numberOfEntries > 0 ||
+        pVdexDepData->classes.numberOfEntries > 0 || pVdexDepData->fields.numberOfEntries > 0 ||
+        pVdexDepData->methods.numberOfEntries > 0 ||
+        pVdexDepData->unvfyClasses.numberOfEntries > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void destroyDepsInfo(const vdexDeps_019 *pVdexDeps) {
   for (u4 i = 0; i < pVdexDeps->numberOfDexFiles; ++i) {
     free((void *)pVdexDeps->pVdexDepData[i].extraStrings.strings);
@@ -227,8 +281,13 @@ void vdex_backend_019_dumpDepsInfo(const u1 *vdexFileBuf) {
   // Initialize depsInfo structs
   vdexDeps_019 *pVdexDeps = initDepsInfo(vdexFileBuf);
   if (pVdexDeps == NULL) {
-    LOGMSG(l_WARN, "Empty verified dependency data");
+    LOGMSG(l_WARN, "Malformed verified dependencies data");
     return;
+  }
+
+  if (!hasDepsData(pVdexDeps)) {
+    LOGMSG(l_DEBUG, "Empty verified dependencies data");
+    goto cleanup;
   }
 
   log_dis("------- Vdex Deps Info -------\n");
@@ -325,7 +384,8 @@ void vdex_backend_019_dumpDepsInfo(const u1 *vdexFileBuf) {
   }
   log_dis("----- EOF Vdex Deps Info -----\n");
 
-  // Cleanup
+// Cleanup
+cleanup:
   destroyDepsInfo(pVdexDeps);
 }
 
@@ -333,6 +393,8 @@ int vdex_backend_019_process(const char *VdexFileName,
                              const u1 *cursor,
                              size_t bufSz,
                              const runArgs_t *pRunArgs) {
+  int ret = 0;
+
   // Basic size checks
   if (!vdex_019_SanityCheck(cursor, bufSz)) {
     LOGMSG(l_ERROR, "Malformed Vdex file");
@@ -351,10 +413,6 @@ int vdex_backend_019_process(const char *VdexFileName,
 
   // For each Dex file
   for (size_t dex_file_idx = 0; dex_file_idx < pVdexHeader->numberOfDexFiles; ++dex_file_idx) {
-    QuickeningInfoItInit(dex_file_idx, pVdexHeader->numberOfDexFiles,
-                         vdex_019_GetQuickeningInfo(cursor),
-                         vdex_019_GetQuickeningInfoSize(cursor));
-
     dexFileBuf = vdex_019_GetNextDexFileData(cursor, &offset);
     if (dexFileBuf == NULL) {
       LOGMSG(l_ERROR, "Failed to extract 'classes%zu.dex' - skipping", dex_file_idx);
@@ -368,12 +426,34 @@ int vdex_backend_019_process(const char *VdexFileName,
       continue;
     }
 
+    vdex_data_array_t quickenInfo, quickenInfoOffTable;
+    vdex_019_GetQuickeningInfo(cursor, &quickenInfo);
+
+    // Check if there is something to decompile
+    if (quickenInfo.size == 0) {
+      LOGMSG(l_DEBUG, "Nothing to decompile in 'classes%zu.dex'", dex_file_idx);
+    } else {
+      vdex_019_GetQuickenInfoOffsetTable(dexFileBuf, &quickenInfo, &quickenInfoOffTable);
+      initCompactOffset(quickenInfoOffTable.data);
+    }
+
+    // Make sure to not unquicken the same code item multiple times.
+    hashset_t unquickened_code_items = hashset_create();
+    if (!unquickened_code_items) {
+      LOGMSG(l_ERROR, "Failed to create hashset");
+      return -1;
+    }
+
     // For each class
     log_dis("file #%zu: classDefsSize=%" PRIu32 "\n", dex_file_idx,
             dex_getClassDefsSize(dexFileBuf));
     for (u4 i = 0; i < dex_getClassDefsSize(dexFileBuf); ++i) {
       const dexClassDef *pDexClassDef = dex_getClassDef(dexFileBuf, i);
+
       dex_dumpClassInfo(dexFileBuf, i);
+
+      // Last read field or method index to apply delta to
+      u4 lastIdx = 0;
 
       // Cursor for currently processed class data item
       const u1 *curClassDataCursor;
@@ -392,6 +472,10 @@ int vdex_backend_019_process(const char *VdexFileName,
         dexField pDexField;
         memset(&pDexField, 0, sizeof(dexField));
         dex_readClassDataField(&curClassDataCursor, &pDexField);
+
+        // APIs are unhidden regardless if we're decompiling or not
+        dex_unhideAccessFlags((u1 *)curClassDataCursor,
+                              dex_decodeAccessFlagsFromDex(pDexField.accessFlags), false);
       }
 
       // Skip instance fields
@@ -399,106 +483,193 @@ int vdex_backend_019_process(const char *VdexFileName,
         dexField pDexField;
         memset(&pDexField, 0, sizeof(dexField));
         dex_readClassDataField(&curClassDataCursor, &pDexField);
+
+        // APIs are unhidden regardless if we're decompiling or not
+        dex_unhideAccessFlags((u1 *)curClassDataCursor,
+                              dex_decodeAccessFlagsFromDex(pDexField.accessFlags), false);
       }
 
       // For each direct method
+      lastIdx = 0;
       for (u4 j = 0; j < pDexClassDataHeader.directMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "direct");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "direct");
+
+        // APIs are unhidden regardless if we're decompiling or not
+        dex_unhideAccessFlags((u1 *)curClassDataCursor,
+                              dex_decodeAccessFlagsFromDex(curDexMethod.accessFlags), true);
 
         // Skip empty methods
         if (curDexMethod.codeOff == 0) {
-          continue;
+          goto next_dmethod;
         }
 
         if (pRunArgs->unquicken) {
-          // TODO: Port to Vdex 019 QueckiningInfo struct
-          LOGMSG(l_FATAL, "Decompiler is under development");
-          const u1 *quickening_ptr = QuickeningInfoItGetCurrentPtr();
-          u4 quickening_size = QuickeningInfoItGetCurrentSize();
-          if (!QuickeningInfoItDone() &&
-              curDexMethod.codeOff == QuickeningInfoItGetCurrentCodeItemOffset()) {
-            QuickeningInfoItAdvance();
-          } else {
-            quickening_ptr = NULL;
-            quickening_size = 0;
+          // Check if we've already unquickened the code item
+          u2 *pCode = NULL;
+          u4 codeSize = 0;
+          dex_getCodeItemInfo(dexFileBuf, &curDexMethod, &pCode, &codeSize);
+          if (hashset_is_member(unquickened_code_items, (void *)pCode)) {
+            vdex_decompiler_019_walk(dexFileBuf, &curDexMethod);
+            goto next_dmethod;
           }
-          if (!vdex_decompiler_019_decompile(dexFileBuf, &curDexMethod, quickening_ptr,
-                                             quickening_size, true)) {
+
+          // Since new code item, add to set
+          hashset_add(unquickened_code_items, (void *)pCode);
+
+          // Offset being 0 means not quickened.
+          const u4 qOffset = getOffset(lastIdx + curDexMethod.methodIdx);
+
+          // Get quickenData for method and decompile
+          vdex_data_array_t quickenData;
+          memset(&quickenData, 0, sizeof(vdex_data_array_t));
+          if (quickenInfo.size != 0 && qOffset != 0u) {
+            getQuickeningInfoAt(&quickenInfo, qOffset, &quickenData);
+          }
+
+          if (!vdex_decompiler_019_decompile(dexFileBuf, &curDexMethod, &quickenData, true)) {
             LOGMSG(l_ERROR, "Failed to decompile Dex file");
+            hashset_destroy(unquickened_code_items);
             return -1;
           }
+
+        next_dmethod:
+          // Update lastIdx since followings delta_idx are based on 1st elements idx
+          lastIdx += curDexMethod.methodIdx;
         } else {
           vdex_decompiler_019_walk(dexFileBuf, &curDexMethod);
         }
-      }
+      }  // EOF direct methods iterator
 
       // For each virtual method
+      lastIdx = 0;
       for (u4 j = 0; j < pDexClassDataHeader.virtualMethodsSize; ++j) {
         dexMethod curDexMethod;
         memset(&curDexMethod, 0, sizeof(dexMethod));
         dex_readClassDataMethod(&curClassDataCursor, &curDexMethod);
-        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, j, "virtual");
+        dex_dumpMethodInfo(dexFileBuf, &curDexMethod, lastIdx, "virtual");
+
+        // APIs are unhidden regardless if we're decompiling or not
+        dex_unhideAccessFlags((u1 *)curClassDataCursor,
+                              dex_decodeAccessFlagsFromDex(curDexMethod.accessFlags), true);
 
         // Skip native or abstract methods
         if (curDexMethod.codeOff == 0) {
-          continue;
+          goto next_vmethod;
         }
 
         if (pRunArgs->unquicken) {
-          // TODO: Port to Vdex 019 QueckiningInfo struct
-          LOGMSG(l_FATAL, "Decompiler is under development");
-          const u1 *quickening_ptr = QuickeningInfoItGetCurrentPtr();
-          u4 quickening_size = QuickeningInfoItGetCurrentSize();
-          if (!QuickeningInfoItDone() &&
-              curDexMethod.codeOff == QuickeningInfoItGetCurrentCodeItemOffset()) {
-            QuickeningInfoItAdvance();
-          } else {
-            quickening_ptr = NULL;
-            quickening_size = 0;
+          // Check if we've already unquickened the code item
+          u2 *pCode = NULL;
+          u4 codeSize = 0;
+          dex_getCodeItemInfo(dexFileBuf, &curDexMethod, &pCode, &codeSize);
+          if (hashset_is_member(unquickened_code_items, (void *)pCode)) {
+            vdex_decompiler_019_walk(dexFileBuf, &curDexMethod);
+            goto next_vmethod;
           }
-          if (!vdex_decompiler_019_decompile(dexFileBuf, &curDexMethod, quickening_ptr,
-                                             quickening_size, true)) {
+
+          // Since new code item, add to set
+          hashset_add(unquickened_code_items, (void *)pCode);
+
+          // Offset being 0 means not quickened.
+          const u4 qOffset = getOffset(lastIdx + curDexMethod.methodIdx);
+
+          // Get quickenData for method and decompile
+          vdex_data_array_t quickenData;
+          memset(&quickenData, 0, sizeof(vdex_data_array_t));
+          if (quickenInfo.size != 0 && qOffset != 0u) {
+            getQuickeningInfoAt(&quickenInfo, qOffset, &quickenData);
+          }
+
+          if (!vdex_decompiler_019_decompile(dexFileBuf, &curDexMethod, &quickenData, true)) {
             LOGMSG(l_ERROR, "Failed to decompile Dex file");
+            hashset_destroy(unquickened_code_items);
             return -1;
           }
+
+        next_vmethod:
+          // Update lastIdx since followings delta_idx are based on 1st elements idx
+          lastIdx += curDexMethod.methodIdx;
         } else {
           vdex_decompiler_019_walk(dexFileBuf, &curDexMethod);
         }
-      }
+      }  // EOF virtual methods iterator
+    }
+
+    // Destroy hashset for current dex file
+    hashset_destroy(unquickened_code_items);
+
+    // Some adjustments that are needed for the deduplicated shared data section
+    const u1 *dataBuf = NULL;
+    u4 dataSize = 0;
+    if (dex_checkType(dexFileBuf) == kCompactDex) {
+      cdexHeader *pCdexHeader = (cdexHeader *)dexFileBuf;
+      u4 mainSectionSize = pCdexHeader->fileSize;
+      u4 shared_section_size = pCdexHeader->dataSize;
+      const u1 *origDataAddr = dex_getDataAddr(dexFileBuf);
+
+      // The shared section will be serialized right after the dex file.
+      pCdexHeader->dataOff = pCdexHeader->fileSize;
+      pCdexHeader->fileSize += shared_section_size;
+
+      // Allocate a new map
+      const u1 *cdexBuf = utils_malloc(pCdexHeader->fileSize);
+
+      // Copy main section
+      memcpy((void *)cdexBuf, dexFileBuf, mainSectionSize);
+
+      // Copy data section
+      memcpy((void *)(cdexBuf + mainSectionSize), origDataAddr, shared_section_size);
+
+      dataBuf = cdexBuf;
+      dataSize = pCdexHeader->fileSize;
+    } else {
+      dataBuf = dexFileBuf;
+      dataSize = dex_getFileSize(dexFileBuf);
     }
 
     if (pRunArgs->unquicken) {
-      // All QuickeningInfo data should have been consumed
-      if (!QuickeningInfoItDone()) {
-        LOGMSG(l_ERROR, "Failed to use all quickening info");
-        return -1;
-      }
-      // If unquicken was successful original checksum should verify
-      u4 curChecksum = dex_computeDexCRC(dexFileBuf, dex_getFileSize(dexFileBuf));
-      if (curChecksum != dex_getChecksum(dexFileBuf)) {
-        // If ignore CRC errors is enabled, repair CRC (see issue #3)
-        if (pRunArgs->ignoreCrc) {
-          dex_repairDexCRC(dexFileBuf, dex_getFileSize(dexFileBuf));
-        } else {
-          LOGMSG(l_ERROR,
-                 "Unexpected checksum (%" PRIx32 " vs %" PRIx32 ") - failed to unquicken Dex file",
-                 curChecksum, dex_getChecksum(dexFileBuf));
-          return -1;
+      // TODO: Update this after a method to convert CDEX->DEX is decided
+      if (dex_checkType(dataBuf) == kCompactDex) {
+        dex_repairDexCRC(dataBuf, dataSize);
+      } else {
+        // If unquicken was successful original checksum should verify
+        u4 curChecksum = dex_computeDexCRC(dataBuf, dataSize);
+        if (curChecksum != dex_getChecksum(dataBuf)) {
+          // If ignore CRC errors is enabled, repair CRC (see issue #3)
+          if (pRunArgs->ignoreCrc) {
+            dex_repairDexCRC(dataBuf, dataSize);
+          } else {
+            LOGMSG(l_ERROR, "Unexpected checksum (%" PRIx32 " vs %" PRIx32
+                            ") - failed to unquicken Dex file",
+                   curChecksum, dex_getChecksum(dataBuf));
+            ret = -1;
+            goto loop_end;
+          }
         }
       }
     } else {
       // Repair CRC if not decompiling so we can still run Dex parsing tools against output
-      dex_repairDexCRC(dexFileBuf, dex_getFileSize(dexFileBuf));
+      dex_repairDexCRC(dataBuf, dataSize);
     }
 
-    if (!outWriter_DexFile(pRunArgs, VdexFileName, dex_file_idx, dexFileBuf,
-                           dex_getFileSize(dexFileBuf))) {
-      return -1;
+    if (!outWriter_DexFile(pRunArgs, VdexFileName, dex_file_idx, dataBuf, dataSize)) {
+      ret = -1;
+      goto loop_end;
     }
-  }
+
+  loop_end:
+    if (dex_checkType(dataBuf) == kCompactDex) {
+      free((void *)dataBuf);
+    }
+
+    // Check if we have a cached error from current dexFile
+    if (ret != 0) {
+      return ret;
+    }
+  }  // EOF of dex file iterator
 
   return pVdexHeader->numberOfDexFiles;
 }

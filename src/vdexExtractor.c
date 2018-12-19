@@ -27,7 +27,7 @@
 #include "common.h"
 #include "log.h"
 #include "utils.h"
-#include "vdex.h"
+#include "vdex_api.h"
 
 // exit() wrapper
 void exitWrapper(int errCode) {
@@ -48,6 +48,7 @@ static void usage(bool exit_success) {
              " --dis                : enable bytecode disassembler\n"
              " --ignore-crc-error   : decompiled Dex CRC errors are ignored (see issue #3)\n"
              " --new-crc=<path>     : text file with extracted Apk or Dex file location checksum(s)\n"
+             " --get-api             : get Android API level based on Vdex version (expects single Vdex file)\n"
              " -v, --debug=LEVEL    : log level (0 - FATAL ... 4 - DEBUG), default: '3' (INFO)\n"
              " -l, --log-file=<path>: save disassembler and/or verified dependencies output to log "
                                      "file (default is STDOUT)\n"
@@ -72,12 +73,13 @@ int main(int argc, char **argv) {
     .ignoreCrc = false,
     .dumpDeps = false,
     .newCrcFile = NULL,
+    .getApi = false,
   };
   infiles_t pFiles = {
     .inputFile = NULL, .files = NULL, .fileCnt = 0,
   };
-  vdex_env_t vdex_env;
-  vdex_env_t *pVdex = &vdex_env;
+  vdex_api_env_t vdex_api_env;
+  vdex_api_env_t *pVdex = &vdex_api_env;
 
   if (argc < 1) usage(true);
 
@@ -89,6 +91,7 @@ int main(int argc, char **argv) {
                                { "deps", no_argument, 0, 0x103 },
                                { "new-crc", required_argument, 0, 0x104 },
                                { "ignore-crc-error", no_argument, 0, 0x105 },
+                               { "get-api", no_argument, 0, 0x106 },
                                { "debug", required_argument, 0, 'v' },
                                { "log-file", required_argument, 0, 'l' },
                                { "help", no_argument, 0, 'h' },
@@ -119,6 +122,9 @@ int main(int argc, char **argv) {
         break;
       case 0x105:
         pRunArgs.ignoreCrc = true;
+        break;
+      case 0x106:
+        pRunArgs.getApi = true;
         break;
       case 'v':
         logLevel = atoi(optarg);
@@ -154,7 +160,29 @@ int main(int argc, char **argv) {
     exitWrapper(EXIT_FAILURE);
   }
 
+  // Check output directory
+  if (pRunArgs.outputDir && !utils_isValidDir(pRunArgs.outputDir)) {
+    LOGMSG(l_FATAL, "'%s' output directory is not valid", pRunArgs.outputDir);
+    exitWrapper(EXIT_FAILURE);
+  }
+
   int mainRet = EXIT_FAILURE;
+
+  if (pRunArgs.getApi) {
+    if (pFiles.fileCnt != 1) {
+      LOGMSG(l_ERROR, "Exactly one input Vdex file is expected when querying API level");
+      goto complete;
+    }
+
+    if (!vdexApi_printApiLevel(pFiles.files[0])) {
+      LOGMSG(l_ERROR, "Invalid or unsupported input Vdex file");
+    } else {
+      mainRet = EXIT_SUCCESS;
+    }
+
+    // We're done
+    goto complete;
+  }
 
   // Parse input file with checksums (expects one per line) and update location checksum
   if (pRunArgs.newCrcFile) {
@@ -170,7 +198,7 @@ int main(int argc, char **argv) {
       goto complete;
     }
 
-    if (!vdex_updateChecksums(pFiles.files[0], nSums, checksums, &pRunArgs)) {
+    if (!vdexApi_updateChecksums(pFiles.files[0], nSums, checksums, &pRunArgs)) {
       LOGMSG(l_ERROR, "Failed to update location checksums");
     } else {
       mainRet = EXIT_SUCCESS;
@@ -201,11 +229,9 @@ int main(int argc, char **argv) {
     }
 
     // Validate Vdex magic header and initialize matching version backend
-    if (!vdex_initEnv(buf, pVdex)) {
+    if (!vdexApi_initEnv(buf, pVdex)) {
       LOGMSG(l_WARN, "Invalid Vdex header - skipping '%s'", pFiles.files[f]);
-      munmap(buf, fileSz);
-      close(srcfd);
-      continue;
+      goto next_file;
     }
 
     pVdex->dumpHeaderInfo(buf);
@@ -229,26 +255,24 @@ int main(int argc, char **argv) {
     int ret = pVdex->process(pFiles.files[f], buf, (size_t)fileSz, &pRunArgs);
     if (ret == -1) {
       LOGMSG(l_ERROR, "Failed to process Dex files - skipping '%s'", pFiles.files[f]);
-      munmap(buf, fileSz);
-      close(srcfd);
-      continue;
+      goto next_file;
     }
 
     processedDexCnt += ret;
     processedVdexCnt++;
 
+  next_file:
     // Clean-up
     munmap(buf, fileSz);
-    buf = NULL;
     close(srcfd);
   }
 
   DISPLAY(l_INFO, "%zu out of %u Vdex files have been processed", processedVdexCnt, vdexCnt);
   DISPLAY(l_INFO, "%u Dex files have been extracted in total", processedDexCnt);
   DISPLAY(l_INFO, "Extracted Dex files are available in '%s'",
-          pRunArgs.outputDir
-              ? pRunArgs.outputDir
-              : (utils_isDir(pFiles.inputFile) ? pFiles.inputFile : dirname(pFiles.inputFile)));
+          pRunArgs.outputDir ? pRunArgs.outputDir
+                             : (utils_isValidDir(pFiles.inputFile) ? pFiles.inputFile
+                                                                   : dirname(pFiles.inputFile)));
   mainRet = EXIT_SUCCESS;
 
 complete:

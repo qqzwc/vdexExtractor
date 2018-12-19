@@ -28,7 +28,7 @@ static size_t quicken_info_number_of_indices;
 static size_t quicken_index;
 
 static u2 GetData(size_t index) {
-  return quicken_info_ptr[index * 2] | (u2)(quicken_info_ptr[index * 2 + 1] << 8);
+  return quicken_info_ptr[index * 2] | ((u2)(quicken_info_ptr[index * 2 + 1]) << 8);
 }
 
 static size_t NumberOfIndices(size_t bytes) { return bytes / sizeof(u2); }
@@ -93,21 +93,20 @@ static void DecompileInvokeVirtual(u2 *insns, Code new_opcode, bool is_range) {
 
 bool vdex_decompiler_010_decompile(const u1 *dexFileBuf,
                                    dexMethod *pDexMethod,
-                                   const u1 *quickening_info,
-                                   u4 quickening_size,
+                                   const vdex_data_array_t *pQuickInfo,
                                    bool decompile_return_instruction) {
-  if (quickening_size == 0 && !decompile_return_instruction) {
+  if (pQuickInfo->size == 0 && !decompile_return_instruction) {
     return true;
   }
 
   dexCode *pDexCode = (dexCode *)(dexFileBuf + pDexMethod->codeOff);
   u4 startCodeOff = dex_getFirstInstrOff(dexFileBuf, pDexMethod);
 
-  quicken_info_ptr = quickening_info;
+  quicken_info_ptr = pQuickInfo->data;
   quicken_index = 0;
-  quicken_info_number_of_indices = NumberOfIndices(quickening_size);
+  quicken_info_number_of_indices = NumberOfIndices(pQuickInfo->size);
 
-  log_dis("    quickening_size=%" PRIx32 " (%" PRIu32 ")\n", quickening_size, quickening_size);
+  log_dis("    quickening_size=%" PRIx32 " (%" PRIu32 ")\n", pQuickInfo->size, pQuickInfo->size);
   initCodeIterator(pDexCode->insns, pDexCode->insnsSize, startCodeOff);
 
   while (isCodeIteratorDone() == false) {

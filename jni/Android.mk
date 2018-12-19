@@ -22,9 +22,13 @@ LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 LOCAL_MODULE    := vdexExtractor
 SRC             := ../src
-SRC_FILE_LIST   := $(wildcard $(LOCAL_PATH)/$(SRC)/*.c) $(wildcard $(LOCAL_PATH)/$(SRC)/*/*.c)
+SRC_FILE_LIST   := $(sort $(wildcard $(LOCAL_PATH)/$(SRC)/*.c)) $(sort $(wildcard $(LOCAL_PATH)/$(SRC)/*/*.c))
 LOCAL_SRC_FILES := $(SRC_FILE_LIST:$(LOCAL_PATH)/%=%)
 LOCAL_CFLAGS    += -c -std=c11 -D_GNU_SOURCE \
                    -Wall -Wextra -Werror
 LOCAL_LDFLAGS   += -lm -lz
+
+GIT_VERSION := $(shell git rev-parse --short HEAD | tr -d "\n")
+LOCAL_CFLAGS += -DVERSION=\"dev-$(GIT_VERSION)\"
+
 include $(BUILD_EXECUTABLE)
